@@ -97,6 +97,8 @@ const BuildMessage = JSC.BuildMessage;
 const ResolveMessage = JSC.ResolveMessage;
 const Async = bun.Async;
 
+const Ordinal = bun.Ordinal;
+
 pub const OpaqueCallback = *const fn (current: ?*anyopaque) callconv(.C) void;
 pub fn OpaqueWrap(comptime Context: type, comptime Function: fn (this: *Context) void) OpaqueCallback {
     return struct {
@@ -195,11 +197,8 @@ pub const SavedSourceMap = struct {
         pub fn print() void {
             if (seen_invalid) return;
             if (path) |note| {
-                Output.note(
-                    "missing sourcemaps for {s}",
-                    .{note},
-                );
-                Output.note("consider bundling with '--sourcemap' to get an unminified traces", .{});
+                Output.note("missing sourcemaps for {s}", .{note});
+                Output.note("consider bundling with '--sourcemap' to get unminified traces", .{});
             }
         }
     };
@@ -393,7 +392,7 @@ pub export fn Bun__GlobalObject__hasIPC(global: *JSC.JSGlobalObject) bool {
 pub export fn Bun__Process__send(
     globalObject: *JSGlobalObject,
     callFrame: *JSC.CallFrame,
-) JSValue {
+) callconv(JSC.conv) JSValue {
     JSC.markBinding(@src());
     if (callFrame.argumentsCount() < 1) {
         globalObject.throwInvalidArguments("process.send requires at least one argument", .{});
@@ -416,7 +415,7 @@ pub export fn Bun__isBunMain(globalObject: *JSGlobalObject, str: *const bun.Stri
 pub export fn Bun__Process__disconnect(
     globalObject: *JSGlobalObject,
     callFrame: *JSC.CallFrame,
-) JSValue {
+) callconv(JSC.conv) JSValue {
     JSC.markBinding(@src());
     _ = callFrame;
     _ = globalObject;
@@ -461,12 +460,9 @@ pub export fn Bun__reportUnhandledError(globalObject: *JSGlobalObject, value: JS
 pub export fn Bun__queueTaskConcurrently(global: *JSGlobalObject, task: *JSC.CppTask) void {
     JSC.markBinding(@src());
 
-    const concurrent = bun.default_allocator.create(JSC.ConcurrentTask) catch unreachable;
-    concurrent.* = JSC.ConcurrentTask{
-        .task = Task.init(task),
-        .auto_delete = true,
-    };
-    global.bunVMConcurrently().eventLoop().enqueueTaskConcurrent(concurrent);
+    global.bunVMConcurrently().eventLoop().enqueueTaskConcurrent(
+        JSC.ConcurrentTask.create(Task.init(task)),
+    );
 }
 
 pub export fn Bun__handleRejectedPromise(global: *JSGlobalObject, promise: *JSC.JSPromise) void {
@@ -524,7 +520,7 @@ pub const ExitHandler = struct {
 
     pub fn dispatchOnExit(this: *ExitHandler) void {
         JSC.markBinding(@src());
-        var vm = @fieldParentPtr(VirtualMachine, "exit_handler", this);
+        const vm: *VirtualMachine = @alignCast(@fieldParentPtr("exit_handler", this));
         Process__dispatchOnExit(vm.global, this.exit_code);
         if (vm.isMainThread()) {
             Bun__closeAllSQLiteDatabasesForTermination();
@@ -533,7 +529,7 @@ pub const ExitHandler = struct {
 
     pub fn dispatchOnBeforeExit(this: *ExitHandler) void {
         JSC.markBinding(@src());
-        const vm = @fieldParentPtr(VirtualMachine, "exit_handler", this);
+        const vm: *VirtualMachine = @alignCast(@fieldParentPtr("exit_handler", this));
         Process__dispatchOnBeforeExit(vm.global, this.exit_code);
     }
 };
@@ -594,6 +590,26 @@ pub const ImportWatcher = union(enum) {
 
 pub const PlatformEventLoop = if (Environment.isPosix) uws.Loop else bun.Async.Loop;
 
+export fn Bun__setTLSRejectUnauthorizedValue(value: i32) void {
+    VirtualMachine.get().default_tls_reject_unauthorized = value != 0;
+}
+
+export fn Bun__getTLSRejectUnauthorizedValue() i32 {
+    return if (JSC.VirtualMachine.get().getTLSRejectUnauthorized()) 1 else 0;
+}
+
+export fn Bun__setVerboseFetchValue(value: i32) void {
+    VirtualMachine.get().default_verbose_fetch = if (value == 1) .headers else if (value == 2) .curl else .none;
+}
+
+export fn Bun__getVerboseFetchValue() i32 {
+    return switch (JSC.VirtualMachine.get().getVerboseFetch()) {
+        .none => 0,
+        .headers => 1,
+        .curl => 2,
+    };
+}
+
 /// TODO: rename this to ScriptExecutionContext
 /// This is the shared global state for a single JS instance execution
 /// Today, Bun is one VM per thread, so the name "VirtualMachine" sort of makes sense
@@ -614,7 +630,7 @@ pub const VirtualMachine = struct {
     entry_point: ServerEntryPoint = undefined,
     origin: URL = URL{},
     node_fs: ?*Node.NodeFS = null,
-    timer: Bun.Timer = Bun.Timer{},
+    timer: Bun.Timer.All = .{},
     event_loop_handle: ?*PlatformEventLoop = null,
     pending_unref_counter: i32 = 0,
     preload: []const string = &[_][]const u8{},
@@ -635,6 +651,9 @@ pub const VirtualMachine = struct {
     is_main_thread: bool = false,
     last_reported_error_for_dedupe: JSValue = .zero,
     exit_handler: ExitHandler = .{},
+
+    default_tls_reject_unauthorized: ?bool = null,
+    default_verbose_fetch: ?bun.http.HTTPVerboseLevel = null,
 
     /// Do not access this field directly
     /// It exists in the VirtualMachine struct so that
@@ -755,8 +774,28 @@ pub const VirtualMachine = struct {
         return this.debugger != null;
     }
 
-    pub inline fn isShuttingDown(this: *const VirtualMachine) bool {
+    pub fn isShuttingDown(this: *const VirtualMachine) bool {
         return this.is_shutting_down;
+    }
+
+    pub fn getTLSRejectUnauthorized(this: *const VirtualMachine) bool {
+        return this.default_tls_reject_unauthorized orelse this.bundler.env.getTLSRejectUnauthorized();
+    }
+
+    pub fn getVerboseFetch(this: *VirtualMachine) bun.http.HTTPVerboseLevel {
+        return this.default_verbose_fetch orelse {
+            if (this.bundler.env.get("BUN_CONFIG_VERBOSE_FETCH")) |verbose_fetch| {
+                if (strings.eqlComptime(verbose_fetch, "true") or strings.eqlComptime(verbose_fetch, "1")) {
+                    this.default_verbose_fetch = .headers;
+                    return .headers;
+                } else if (strings.eqlComptime(verbose_fetch, "curl")) {
+                    this.default_verbose_fetch = .curl;
+                    return .curl;
+                }
+            }
+            this.default_verbose_fetch = .none;
+            return .none;
+        };
     }
 
     const VMHolder = struct {
@@ -927,6 +966,11 @@ pub const VirtualMachine = struct {
     extern fn Bun__Process__exit(*JSC.JSGlobalObject, code: c_int) noreturn;
 
     pub fn unhandledRejection(this: *JSC.VirtualMachine, globalObject: *JSC.JSGlobalObject, reason: JSC.JSValue, promise: JSC.JSValue) bool {
+        if (this.isShuttingDown()) {
+            Output.debugWarn("unhandledRejection during shutdown.", .{});
+            return true;
+        }
+
         if (isBunTest) {
             this.unhandled_error_counter += 1;
             this.onUnhandledRejection(this, globalObject, reason);
@@ -942,6 +986,11 @@ pub const VirtualMachine = struct {
     }
 
     pub fn uncaughtException(this: *JSC.VirtualMachine, globalObject: *JSC.JSGlobalObject, err: JSC.JSValue, is_rejection: bool) bool {
+        if (this.isShuttingDown()) {
+            Output.debugWarn("uncaughtException during shutdown.", .{});
+            return true;
+        }
+
         if (isBunTest) {
             this.unhandled_error_counter += 1;
             this.onUnhandledRejection(this, globalObject, err);
@@ -955,7 +1004,7 @@ pub const VirtualMachine = struct {
         }
         this.is_handling_uncaught_exception = true;
         defer this.is_handling_uncaught_exception = false;
-        const handled = Bun__handleUncaughtException(globalObject, err, if (is_rejection) 1 else 0) > 0;
+        const handled = Bun__handleUncaughtException(globalObject, err.toError() orelse err, if (is_rejection) 1 else 0) > 0;
         if (!handled) {
             // TODO maybe we want a separate code path for uncaught exceptions
             this.unhandled_error_counter += 1;
@@ -1069,9 +1118,13 @@ pub const VirtualMachine = struct {
         }
     }
 
-    pub fn scriptExecutionStatus(this: *VirtualMachine) callconv(.C) JSC.ScriptExecutionStatus {
+    pub fn scriptExecutionStatus(this: *const VirtualMachine) callconv(.C) JSC.ScriptExecutionStatus {
+        if (this.is_shutting_down) {
+            return .stopped;
+        }
+
         if (this.worker) |worker| {
-            if (worker.requested_terminate) {
+            if (worker.hasRequestedTerminate()) {
                 return .stopped;
             }
         }
@@ -1174,7 +1227,9 @@ pub const VirtualMachine = struct {
             }
 
             debug("spin", .{});
-            while (futex_atomic.load(.Monotonic) > 0) std.Thread.Futex.wait(&futex_atomic, 1);
+            while (futex_atomic.load(.monotonic) > 0) {
+                std.Thread.Futex.wait(&futex_atomic, 1);
+            }
             if (comptime Environment.allow_assert)
                 debug("waitForDebugger: {}", .{Output.ElapsedFormatter{
                     .colors = Output.enable_ansi_colors_stderr,
@@ -1246,7 +1301,7 @@ pub const VirtualMachine = struct {
             }
 
             debug("wake", .{});
-            futex_atomic.store(0, .Monotonic);
+            futex_atomic.store(0, .monotonic);
             std.Thread.Futex.wake(&futex_atomic, 1);
 
             this.eventLoop().tick();
@@ -1290,10 +1345,6 @@ pub const VirtualMachine = struct {
 
     pub fn waitForPromise(this: *VirtualMachine, promise: JSC.AnyPromise) void {
         this.eventLoop().waitForPromise(promise);
-    }
-
-    pub fn waitForPromiseWithTimeout(this: *VirtualMachine, promise: JSC.AnyPromise, timeout: u32) bool {
-        return this.eventLoop().waitForPromiseWithTimeout(promise, timeout);
     }
 
     pub fn waitForTasks(this: *VirtualMachine) void {
@@ -1723,7 +1774,7 @@ pub const VirtualMachine = struct {
             return ResolvedSource{
                 .source_code = bun.String.init(""),
                 .specifier = specifier,
-                .source_url = bun.String.init(source_url),
+                .source_url = specifier.createIfDifferent(source_url),
                 .hash = 0,
                 .allocator = null,
                 .source_code_needs_deref = false,
@@ -1738,7 +1789,7 @@ pub const VirtualMachine = struct {
         return ResolvedSource{
             .source_code = bun.String.init(source.impl),
             .specifier = specifier,
-            .source_url = bun.String.init(source_url),
+            .source_url = specifier.createIfDifferent(source_url),
             .hash = source.hash,
             .allocator = source,
             .source_code_needs_deref = false,
@@ -1803,7 +1854,17 @@ pub const VirtualMachine = struct {
         const specifier = ModuleLoader.normalizeSpecifier(jsc_vm, specifier_clone.slice(), &display_slice);
         const referrer_clone = referrer.toUTF8(bun.default_allocator);
         defer referrer_clone.deinit();
-        const path = Fs.Path.init(specifier_clone.slice());
+        var path = Fs.Path.init(specifier_clone.slice());
+
+        // For blobs.
+        var blob_source: ?JSC.WebCore.Blob = null;
+        var virtual_source_to_use: ?logger.Source = null;
+        defer {
+            if (blob_source) |*blob| {
+                blob.deinit();
+            }
+        }
+
         const loader, const virtual_source = brk: {
             if (jsc_vm.module_loader.eval_source) |eval_source| {
                 if (strings.endsWithComptime(specifier, bun.pathLiteral("/[eval]"))) {
@@ -1814,14 +1875,68 @@ pub const VirtualMachine = struct {
                 }
             }
 
+            var ext_for_loader = path.name.ext;
+
+            // Support errors within blob: URLs
+            // Be careful to handle Bun.file(), in addition to regular Blob/File objects
+            // Bun.file() should be treated the same as a file path.
+            if (JSC.WebCore.ObjectURLRegistry.isBlobURL(specifier)) {
+                if (JSC.WebCore.ObjectURLRegistry.singleton().resolveAndDupe(specifier["blob:".len..])) |blob| {
+                    blob_source = blob;
+
+                    if (blob.getFileName()) |filename| {
+                        const current_path = Fs.Path.init(filename);
+                        if (blob.needsToReadFile()) {
+                            path = current_path;
+                        }
+
+                        ext_for_loader = current_path.name.ext;
+                    } else if (blob.getMimeTypeOrContentType()) |mime_type| {
+                        if (strings.hasPrefixComptime(mime_type.value, "application/javascript-jsx")) {
+                            ext_for_loader = ".jsx";
+                        } else if (strings.hasPrefixComptime(mime_type.value, "application/typescript-jsx")) {
+                            ext_for_loader = ".tsx";
+                        } else if (strings.hasPrefixComptime(mime_type.value, "application/javascript")) {
+                            ext_for_loader = ".js";
+                        } else if (strings.hasPrefixComptime(mime_type.value, "application/typescript")) {
+                            ext_for_loader = ".ts";
+                        } else if (strings.hasPrefixComptime(mime_type.value, "application/json")) {
+                            ext_for_loader = ".json";
+                        } else if (strings.hasPrefixComptime(mime_type.value, "application/json5")) {
+                            ext_for_loader = ".jsonc";
+                        } else if (strings.hasPrefixComptime(mime_type.value, "application/jsonc")) {
+                            ext_for_loader = ".jsonc";
+                        } else if (mime_type.category == .text) {
+                            ext_for_loader = ".txt";
+                        } else {
+                            // Be maximally permissive.
+                            ext_for_loader = ".tsx";
+                        }
+                    } else {
+                        // Be maximally permissive.
+                        ext_for_loader = ".tsx";
+                    }
+
+                    if (!blob.needsToReadFile()) {
+                        virtual_source_to_use = logger.Source{
+                            .path = path,
+                            .key_path = path,
+                            .contents = blob.sharedView(),
+                        };
+                    }
+                } else {
+                    return error.ModuleNotFound;
+                }
+            }
+
             break :brk .{
-                jsc_vm.bundler.options.loaders.get(path.name.ext) orelse brk2: {
+                jsc_vm.bundler.options.loaders.get(ext_for_loader) orelse brk2: {
                     if (strings.eqlLong(specifier, jsc_vm.main, true)) {
                         break :brk2 options.Loader.js;
                     }
                     break :brk2 options.Loader.file;
                 },
-                null,
+                if (virtual_source_to_use) |*src| src else null,
             };
         };
 
@@ -1905,6 +2020,14 @@ pub const VirtualMachine = struct {
             ret.result = null;
             ret.path = specifier;
             return;
+        } else if (strings.hasPrefixComptime(specifier, "blob:")) {
+            ret.result = null;
+            if (JSC.WebCore.ObjectURLRegistry.singleton().has(specifier["blob:".len..])) {
+                ret.path = specifier;
+                return;
+            } else {
+                return error.ModuleNotFound;
+            }
         }
 
         const is_special_source = strings.eqlComptime(source, main_file_name) or js_ast.Macro.isMacroPath(source);
@@ -2043,7 +2166,7 @@ pub const VirtualMachine = struct {
                 specifier_utf8.slice(),
                 source_utf8.slice(),
                 error.NameTooLong,
-            ) catch @panic("Out of Memory");
+            ) catch bun.outOfMemory();
             const msg = logger.Msg{
                 .data = logger.rangeData(
                     null,
@@ -2151,16 +2274,6 @@ pub const VirtualMachine = struct {
 
         res.* = ErrorableString.ok(bun.String.init(result.path));
     }
-
-    // // This double prints
-    // pub fn promiseRejectionTracker(global: *JSGlobalObject, promise: *JSPromise, _: JSPromiseRejectionOperation) callconv(.C) JSValue {
-    //     const result = promise.result(global.vm());
-    //     if (@intFromEnum(VirtualMachine.get().last_error_jsvalue) != @intFromEnum(result)) {
-    //         VirtualMachine.get().runErrorHandler(result, null);
-    //     }
-
-    //     return JSValue.jsUndefined();
-    // }
 
     pub const main_file_name: string = "bun:main";
 
@@ -2470,7 +2583,7 @@ pub const VirtualMachine = struct {
             .Internal = promise,
         });
         if (this.worker) |worker| {
-            if (worker.requested_terminate) {
+            if (worker.hasRequestedTerminate()) {
                 return error.WorkerTerminated;
             }
         }
@@ -2539,8 +2652,6 @@ pub const VirtualMachine = struct {
                 .Internal = promise,
             });
         }
-
-        this.eventLoop().autoTick();
 
         return this.pending_internal_promise;
     }
@@ -2829,8 +2940,8 @@ pub const VirtualMachine = struct {
 
             if (this.source_mappings.resolveMapping(
                 sourceURL.slice(),
-                @max(frame.position.line, 0),
-                @max(frame.position.column_start, 0),
+                @max(frame.position.line.zeroBased(), 0),
+                @max(frame.position.column.zeroBased(), 0),
                 .no_source_contents,
             )) |lookup| {
                 if (lookup.displaySourceURLIfNeeded(sourceURL.slice())) |source_url| {
@@ -2838,8 +2949,8 @@ pub const VirtualMachine = struct {
                     frame.source_url = source_url;
                 }
                 const mapping = lookup.mapping;
-                frame.position.line = mapping.original.lines;
-                frame.position.column_start = mapping.original.columns;
+                frame.position.line = Ordinal.fromZeroBased(mapping.original.lines);
+                frame.position.column = Ordinal.fromZeroBased(mapping.original.columns);
                 frame.remapped = true;
             } else {
                 // we don't want it to be remapped again
@@ -2939,8 +3050,8 @@ pub const VirtualMachine = struct {
                 .mapping = .{
                     .generated = .{},
                     .original = .{
-                        .lines = @max(top.position.line, 0),
-                        .columns = @max(top.position.column_start, 0),
+                        .lines = @max(top.position.line.zeroBased(), 0),
+                        .columns = @max(top.position.column.zeroBased(), 0),
                     },
                     .source_index = 0,
                 },
@@ -2951,8 +3062,8 @@ pub const VirtualMachine = struct {
         else
             this.source_mappings.resolveMapping(
                 top_source_url.slice(),
-                @max(top.position.line, 0),
-                @max(top.position.column_start, 0),
+                @max(top.position.line.zeroBased(), 0),
+                @max(top.position.column.zeroBased(), 0),
                 .source_contents,
             );
 
@@ -2973,25 +3084,21 @@ pub const VirtualMachine = struct {
                     }
                 }
 
-                var log = logger.Log.init(default_allocator);
+                var log = logger.Log.init(bun.default_allocator);
+                defer log.deinit();
                 var original_source = fetchWithoutOnLoadPlugins(this, this.global, top.source_url, bun.String.empty, &log, .print_source) catch return;
                 must_reset_parser_arena_later.* = true;
                 break :code original_source.source_code.toUTF8(bun.default_allocator);
             };
             source_code_slice.* = code;
 
-            top.position.line = mapping.original.lines;
-            top.position.line_start = mapping.original.lines;
-            top.position.line_stop = mapping.original.lines + 1;
-            top.position.column_start = mapping.original.columns;
-            top.position.column_stop = mapping.original.columns + 1;
+            top.position.line = Ordinal.fromZeroBased(mapping.original.lines);
+            top.position.column = Ordinal.fromZeroBased(mapping.original.columns);
+
             exception.remapped = true;
             top.remapped = true;
-            // This expression range is no longer accurate
-            top.position.expression_start = mapping.original.columns;
-            top.position.expression_stop = mapping.original.columns + 1;
 
-            const last_line = @max(top.position.line, 0);
+            const last_line = @max(top.position.line.zeroBased(), 0);
             if (strings.getLinesInText(
                 code.slice(),
                 @intCast(last_line),
@@ -3014,13 +3121,6 @@ pub const VirtualMachine = struct {
                 }
 
                 exception.stack.source_lines_len = @as(u8, @truncate(lines.len));
-
-                top.position.column_stop = @as(i32, @intCast(source_lines[lines.len - 1].length()));
-                top.position.line_stop = top.position.column_stop;
-
-                // This expression range is no longer accurate
-                top.position.expression_start = mapping.original.columns;
-                top.position.expression_stop = top.position.column_stop;
             }
         }
 
@@ -3031,8 +3131,8 @@ pub const VirtualMachine = struct {
                 defer source_url.deinit();
                 if (this.source_mappings.resolveMapping(
                     source_url.slice(),
-                    @max(frame.position.line, 0),
-                    @max(frame.position.column_start, 0),
+                    @max(frame.position.line.zeroBased(), 0),
+                    @max(frame.position.column.zeroBased(), 0),
                     .no_source_contents,
                 )) |lookup| {
                     if (lookup.displaySourceURLIfNeeded(source_url.slice())) |src| {
@@ -3040,9 +3140,9 @@ pub const VirtualMachine = struct {
                         frame.source_url = src;
                     }
                     const mapping = lookup.mapping;
-                    frame.position.line = mapping.original.lines;
                     frame.remapped = true;
-                    frame.position.column_start = mapping.original.columns;
+                    frame.position.line = Ordinal.fromZeroBased(mapping.original.lines);
+                    frame.position.column = Ordinal.fromZeroBased(mapping.original.columns);
                 }
             }
         }
@@ -3191,8 +3291,8 @@ pub const VirtualMachine = struct {
                         .{ display_line, bun.fmt.fmtJavaScript(clamped, allow_ansi_color) },
                     );
 
-                    if (clamped.len < max_line_length_with_divot or top.position.column_start > max_line_length_with_divot) {
-                        const indent = max_line_number_pad + " | ".len + @as(u64, @intCast(top.position.column_start));
+                    if (clamped.len < max_line_length_with_divot or top.position.column.zeroBased() > max_line_length_with_divot) {
+                        const indent = max_line_number_pad + " | ".len + @as(u64, @intCast(top.position.column.zeroBased()));
 
                         try writer.writeByteNTimes(' ', indent);
                         try writer.print(comptime Output.prettyFmt(
@@ -3374,8 +3474,8 @@ pub const VirtualMachine = struct {
                 const file = bun.path.relative(dir, source_url.slice());
                 writer.print("\n::error file={s},line={d},col={d},title=", .{
                     file,
-                    frame.position.line_start + 1,
-                    frame.position.column_start,
+                    frame.position.line.oneBased(),
+                    frame.position.column.oneBased(),
                 }) catch {};
                 has_location = true;
             }
@@ -3619,7 +3719,7 @@ pub fn NewHotReloader(comptime Ctx: type, comptime EventLoopType: type, comptime
         ctx: *Ctx,
         verbose: bool = false,
 
-        tombstones: std.StringHashMapUnmanaged(*bun.fs.FileSystem.RealFS.EntriesOption) = .{},
+        tombstones: bun.StringHashMapUnmanaged(*bun.fs.FileSystem.RealFS.EntriesOption) = .{},
 
         pub fn eventLoop(this: @This()) *EventLoopType {
             return this.ctx.eventLoop();
@@ -3710,7 +3810,7 @@ pub fn NewHotReloader(comptime Ctx: type, comptime EventLoopType: type, comptime
                     return;
             }
 
-            var reloader = bun.default_allocator.create(Reloader) catch @panic("OOM");
+            var reloader = bun.default_allocator.create(Reloader) catch bun.outOfMemory();
             reloader.* = .{
                 .ctx = this,
                 .verbose = if (@hasField(Ctx, "log")) this.log.level.atLeast(.info) else false,
@@ -3722,13 +3822,19 @@ pub fn NewHotReloader(comptime Ctx: type, comptime EventLoopType: type, comptime
                         reloader,
                         this.bundler.fs,
                         bun.default_allocator,
-                    ) catch @panic("Failed to enable File Watcher") }
+                    ) catch |err| {
+                        bun.handleErrorReturnTrace(err, @errorReturnTrace());
+                        Output.panic("Failed to enable File Watcher: {s}", .{@errorName(err)});
+                    } }
                 else
                     .{ .hot = @This().Watcher.init(
                         reloader,
                         this.bundler.fs,
                         bun.default_allocator,
-                    ) catch @panic("Failed to enable File Watcher") };
+                    ) catch |err| {
+                        bun.handleErrorReturnTrace(err, @errorReturnTrace());
+                        Output.panic("Failed to enable File Watcher: {s}", .{@errorName(err)});
+                    } };
 
                 if (reload_immediately) {
                     this.bundler.resolver.watcher = Resolver.ResolveWatcher(*@This().Watcher, onMaybeWatchDirectory).init(this.bun_watcher.watch);
@@ -3740,7 +3846,10 @@ pub fn NewHotReloader(comptime Ctx: type, comptime EventLoopType: type, comptime
                     reloader,
                     this.bundler.fs,
                     bun.default_allocator,
-                ) catch @panic("Failed to enable File Watcher");
+                ) catch |err| {
+                    bun.handleErrorReturnTrace(err, @errorReturnTrace());
+                    Output.panic("Failed to enable File Watcher: {s}", .{@errorName(err)});
+                };
                 this.bundler.resolver.watcher = Resolver.ResolveWatcher(*@This().Watcher, onMaybeWatchDirectory).init(this.bun_watcher.?);
             }
 
@@ -3771,6 +3880,9 @@ pub fn NewHotReloader(comptime Ctx: type, comptime EventLoopType: type, comptime
             err: bun.sys.Error,
         ) void {
             Output.err(@as(bun.C.E, @enumFromInt(err.errno)), "Watcher crashed", .{});
+            if (bun.Environment.isDebug) {
+                @panic("Watcher crash");
+            }
         }
 
         pub fn getContext(this: *@This()) *@This().Watcher {
@@ -3878,7 +3990,7 @@ pub fn NewHotReloader(comptime Ctx: type, comptime EventLoopType: type, comptime
                                         if (parent_hash == id) {
                                             const affected_path = file_paths[entry_id];
                                             const was_deleted = check: {
-                                                std.os.access(affected_path, std.os.F_OK) catch break :check true;
+                                                std.posix.access(affected_path, std.posix.F_OK) catch break :check true;
                                                 break :check false;
                                             };
                                             if (!was_deleted) continue;

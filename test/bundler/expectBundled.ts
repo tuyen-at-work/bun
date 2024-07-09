@@ -3,7 +3,7 @@
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, readdirSync, realpathSync } from "fs";
 import path from "path";
-import { bunEnv, bunExe, joinP } from "harness";
+import { bunEnv, bunExe, isDebug } from "harness";
 import { tmpdir } from "os";
 import { callerSourceOrigin } from "bun:jsc";
 import { BuildConfig, BunPlugin, fileURLToPath } from "bun";
@@ -13,7 +13,7 @@ import * as esbuild from "esbuild";
 import { SourceMapConsumer } from "source-map";
 
 /** Dedent module does a bit too much with their stuff. we will be much simpler */
-function dedent(str: string | TemplateStringsArray, ...args: any[]) {
+export function dedent(str: string | TemplateStringsArray, ...args: any[]) {
   // https://github.com/tc39/proposal-string-cooked#motivation
   let single_string = String.raw({ raw: str }, ...args);
   single_string = single_string.trim();
@@ -196,7 +196,7 @@ export interface BundlerTestInput {
   unsupportedJSFeatures?: string[];
   /** if set to true or false, create or edit tsconfig.json to set compilerOptions.useDefineForClassFields */
   useDefineForClassFields?: boolean;
-  sourceMap?: "inline" | "external" | "none";
+  sourceMap?: "inline" | "external" | "linked" | "none";
   plugins?: BunPlugin[] | ((builder: PluginBuilder) => void | Promise<void>);
   install?: string[];
 
@@ -275,9 +275,9 @@ export interface SourceMapTests {
    * for byte snapshots will not be sustainable. Instead, we will sample a few mappings to make sure
    * the map is correct. This can be used to test for a single mapping.
    */
-  mappings: MappingSnapshot[];
+  mappings?: MappingSnapshot[];
   /** For small files it is acceptable to inline all of the mappings. */
-  mappingsExactMatch: string;
+  mappingsExactMatch?: string;
 }
 
 /** Keep in mind this is an array/tuple, NOT AN OBJECT. This keeps things more consise */
@@ -564,7 +564,8 @@ function expectBundled(
         cwd: root,
       });
       if (!installProcess.success) {
-        throw new Error("Failed to install dependencies");
+        const reason = installProcess.signalCode || `code ${installProcess.exitCode}`;
+        throw new Error(`Failed to install dependencies: ${reason}`);
       }
     }
     for (const [file, contents] of Object.entries(files)) {
@@ -1096,12 +1097,39 @@ for (const [key, blob] of build.outputs) {
       options: opts,
       captureFile: (file, fnName = "capture") => {
         const fileContents = readFile(file);
-        const regex = new RegExp(`\\b${fnName}\\s*\\(((?:\\(\\))?.*?)\\)`, "g");
-        const matches = [...fileContents.matchAll(regex)];
+        let i = 0;
+        const length = fileContents.length;
+        const matches = [];
+        while (i < length) {
+          i = fileContents.indexOf(fnName, i);
+          if (i === -1) {
+            break;
+          }
+          const start = i;
+          let depth = 0;
+          while (i < length) {
+            const char = fileContents[i];
+            if (char === "(") {
+              depth++;
+            } else if (char === ")") {
+              depth--;
+              if (depth === 0) {
+                break;
+              }
+            }
+            i++;
+          }
+          if (depth !== 0) {
+            throw new Error(`Could not find closing paren for ${fnName} call in ${file}`);
+          }
+          matches.push(fileContents.slice(start + fnName.length + 1, i));
+          i++;
+        }
+
         if (matches.length === 0) {
           throw new Error(`No ${fnName} calls found in ${file}`);
         }
-        return matches.map(match => match[1]);
+        return matches;
       },
     } satisfies BundlerTestBundleAPI;
 
@@ -1309,7 +1337,7 @@ for (const [key, blob] of build.outputs) {
             });
             const map_tests = snapshotSourceMap?.[path.basename(file)];
             if (map_tests) {
-              expect(parsed.sources).toEqual(map_tests.files);
+              expect(parsed.sources.map((a: string) => a.replaceAll("\\", "/"))).toEqual(map_tests.files);
               for (let i = 0; i < parsed.sources; i++) {
                 const source = parsed.sources[i];
                 const sourcemap_content = parsed.sourceContent[i];
@@ -1515,7 +1543,12 @@ export function itBundled(
   if (opts.todo && !FILTER) {
     it.todo(id, () => expectBundled(id, opts as any));
   } else {
-    it(id, () => expectBundled(id, opts as any));
+    it(
+      id,
+      () => expectBundled(id, opts as any),
+      // sourcemap code is slow
+      isDebug ? Infinity : opts.snapshotSourceMap ? 30_000 : undefined,
+    );
   }
   return ref;
 }
